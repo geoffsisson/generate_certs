@@ -1,0 +1,332 @@
+#!/bin/bash
+
+set -euo pipefail
+
+export PATH='/bin:/usr/bin'
+
+readonly OPENSSL='openssl'
+
+readonly DIR='/var/tmp/ssl'
+readonly CONFIG_FILE='openssl.cnf'
+
+readonly NAME='Acme'
+readonly CA_NAME="${NAME} Root CA"
+readonly CA_FILENAME_BASE=$(echo "${CA_NAME}" |
+    tr '[:upper:]' '[:lower:]' |
+    tr -s '[:blank:]' '_')
+
+readonly SUBJECT_BASE="/C=US/ST=CA/L=San Francisco/O=${NAME}"
+readonly CA_STARTDATE='210101000000Z'
+readonly CA_ENDDATE='211231235959Z'
+
+declare passwd=''
+
+
+function init {
+
+  # exit if CA directory already exists
+  if [[ -e "${DIR}" ]]; then
+    echo "${DIR} already exists, exiting ..."
+    exit 1
+  fi
+
+  # create CA directory and subdirectories
+  install -d -m 755 "${DIR}"
+
+  install -d -m 755 "${DIR}/CA"
+  install -d -m 700 "${DIR}/CA/private"
+  install -d -m 755 "${DIR}/CA/newcerts"
+
+  # initialize CA files
+  install -m 644 /dev/null "${DIR}/${CONFIG_FILE}"
+  install -m 644 /dev/null "${DIR}/CA/index.txt"
+  install -m 644 /dev/null "${DIR}/CA/index.txt.old"
+  install -m 644 /dev/null "${DIR}/CA/index.txt.attr"
+  install -m 644 /dev/null "${DIR}/CA/index.txt.attr.old"
+  install -m 644 /dev/null "${DIR}/CA/serial"
+  install -m 644 /dev/null "${DIR}/CA/serial.old"
+}
+
+
+function gen_conf_file {
+
+  if (($# > 0)); then
+    local sans=$1
+  else
+    sans=''
+  fi
+
+  # generate minimal openssl config file
+  cat > "${DIR}/${CONFIG_FILE}" << EOF
+[ ca ]
+
+default_ca      = CA_default
+
+
+[ CA_default ]
+
+dir             = ${DIR}/CA
+certs           = \$dir/certs
+database        = \$dir/index.txt
+
+new_certs_dir   = \$dir/newcerts
+
+serial          = \$dir/serial
+RANDFILE        = \$dir/private/.rand
+
+certificate     = \$dir/${CA_FILENAME_BASE}_cert.pem
+private_key     = \$dir/private/${CA_FILENAME_BASE}_key.pem
+
+policy          = policy_match
+
+
+[ policy_match ]
+
+countryName             = match
+stateOrProvinceName     = match
+localityName            = match
+organizationName        = match
+organizationalUnitName  = optional
+commonName              = supplied
+emailAddress            = optional
+
+
+[ req ]
+
+distinguished_name      = req_dn
+
+
+[ req_dn ]
+
+
+[ ca_exts ]
+
+#keyUsage                = critical, keyCertSign
+basicConstraints        = critical, CA:TRUE
+subjectKeyIdentifier    = hash
+authorityKeyIdentifier  = keyid
+
+
+[ server_exts ]
+
+keyUsage                = critical, digitalSignature, keyEncipherment
+basicConstraints        = critical, CA:FALSE
+subjectKeyIdentifier    = hash
+extendedKeyUsage        = serverAuth
+authorityKeyIdentifier  = keyid, issuer
+EOF
+
+  if [[ -n "${sans}" ]]; then
+    cat >> "${DIR}/${CONFIG_FILE}" << EOF
+subjectAltName          = @server_alt_names
+
+
+[ server_alt_names ]
+
+EOF
+
+    IFS=',' read -ra san_array <<< "${sans}"
+    i=1
+    for san in "${san_array[@]}"; do
+      echo "DNS.${i}                   = ${san}" >> "${DIR}/${CONFIG_FILE}"
+      ((i++))
+    done
+  fi
+}
+
+
+function read_passwd {
+
+  # prompt for CA passphrase
+
+  local passwd2
+
+  while true; do
+    echo -n 'Passphrase for new CA: '
+    read -s passwd
+    echo
+    if (( "${#passwd}" < 4 )); then
+      echo "pass phrase must be four characters or longer" >&2
+    else
+      break
+    fi
+  done
+  echo -n 'Retype passphrase for new CA: '
+  read -s passwd2
+  echo
+  if [[ "${passwd}" != "${passwd2}" ]]; then
+    echo "pass phrases don't match, exiting ..." >&2
+    exit 1
+  fi
+  echo
+}
+
+
+function gen_ca_cert {
+
+  local ca_csr_filename="${CA_FILENAME_BASE}_csr.pem"
+  local ca_cert_filename="${CA_FILENAME_BASE}_cert.pem"
+  local ca_key_filename="${CA_FILENAME_BASE}_key.pem"
+  local ca_cert_p12_filename="${CA_FILENAME_BASE}_cert.p12"
+
+  gen_conf_file
+
+  # we generate the CA private key separately so that we can specify a
+  # stronger key encryption cipher than the hard-coded one used by
+  # "openssl req -newkey". note that we _don't_ do this for the server
+  # private key as that key is unencrypted.
+
+  echo '>>> generating CA private key ...'
+  ${OPENSSL} genrsa \
+      -aes256 \
+      -out "${DIR}/CA/private/${ca_key_filename}" \
+      -passout pass:"${passwd}" \
+      4096
+
+  chmod 600 "${DIR}/CA/private/${ca_key_filename}"
+
+  echo "${SUBJECT_BASE}/${CA_NAME}"
+
+  while true; do
+    od -A n -t x1 -N 8 /dev/random | tr -d '[:space:]' > "${DIR}/CA/serial"
+    set +e
+    grep -vq '^0' "${DIR}/CA/serial"
+    [[ $? -ne 0 ]] && break
+    set -e
+  done
+
+  echo '>>> generating CA cert request ...'
+  ${OPENSSL} req \
+      -new \
+      -config      "${DIR}/${CONFIG_FILE}" \
+      -subj        "${SUBJECT_BASE}/CN=${CA_NAME}" \
+      -out         "${DIR}/CA/${ca_csr_filename}" \
+      -key         "${DIR}/CA/private/${ca_key_filename}" \
+      -sha256 \
+      -passin      pass:"${passwd}"
+
+  echo '>>> self-signing CA cert ...'
+  ${OPENSSL} ca \
+      -batch \
+      -selfsign \
+      -config      "${DIR}/${CONFIG_FILE}" \
+      -in          "${DIR}/CA/${ca_csr_filename}" \
+      -out         "${DIR}/CA/${ca_cert_filename}" \
+      -keyfile     "${DIR}/CA/private/${ca_key_filename}" \
+      -startdate   "${CA_STARTDATE}" \
+      -enddate     "${CA_ENDDATE}" \
+      -extensions  ca_exts \
+      -md          sha256 \
+      -passin      pass:"${passwd}"
+
+  # link CA cert to top-level dir for convenience
+  ln -s "${DIR}/CA/${ca_cert_filename}" "${DIR}/${ca_cert_filename}"
+
+  ${OPENSSL} pkcs12 \
+      -export \
+      -nodes \
+      -nokeys \
+      -caname      "${CA_NAME}" \
+      -in          "${DIR}/CA/${ca_cert_filename}" \
+      -inkey       "${DIR}/CA/private/${ca_key_filename}" \
+      -out         "${DIR}/${ca_cert_p12_filename}" \
+      -passin       pass:"${passwd}" \
+      -passout      pass:
+
+  echo "CA cert:            ${DIR}/${ca_cert_filename}"
+  echo "CA key:             ${DIR}/CA/private/${ca_key_filename}"
+  echo "CA PKCS #12 cert:   ${DIR}/${ca_cert_p12_filename}"
+  echo
+}
+
+
+function gen_server_cert {
+
+  local filename_base=$1
+  local subject=$2
+  local startdate=$3
+  local enddate=$4
+
+  echo ">>> $#"
+
+  if (( $# > 4 )); then
+    gen_conf_file $5
+  else
+    gen_conf_file
+  fi
+
+  local csr_filename="${filename_base}_csr.pem"
+  local cert_filename="${filename_base}_cert.pem"
+  local key_filename="${filename_base}_key.pem"
+
+  while true; do
+    od -A n -t x1 -N 8 /dev/random | tr -d '[:space:]' > "${DIR}/CA/serial"
+    grep -q '^0.*' "${DIR}/CA/serial"
+    [[ $? -ne 0 ]] && break
+  done
+
+  echo '>>> generating server cert request ...'
+  ${OPENSSL} req \
+      -new \
+      -nodes \
+      -config      "${DIR}/${CONFIG_FILE}" \
+      -subj        "${subject}" \
+      -out         "${DIR}/${csr_filename}" \
+      -keyout      "${DIR}/${key_filename}" \
+      -newkey      rsa:4096 \
+      -sha256
+
+  chmod 600 "${DIR}/${key_filename}"
+
+  echo '>>> signing server cert ...'
+  ${OPENSSL} ca \
+      -batch \
+      -config      "${DIR}/${CONFIG_FILE}" \
+      -in          "${DIR}/${csr_filename}" \
+      -out         "${DIR}/${cert_filename}" \
+      -startdate   "${startdate}" \
+      -enddate     "${enddate}" \
+      -extensions  server_exts \
+      -md          sha256 \
+      -passin      pass:"${passwd}"
+
+  echo '>>> done!'
+  echo
+  echo "Server cert:        ${DIR}/${cert_filename}"
+  echo "Server key:         ${DIR}/${key_filename}"
+  echo
+}
+
+
+function main {
+
+  init
+  read_passwd
+
+  gen_ca_cert
+
+  gen_server_cert \
+          'www_example_com' \
+          "${SUBJECT_BASE}/CN=www.example.com" \
+          "${CA_STARTDATE}" \
+          "${CA_ENDDATE}" \
+          'example.com,www.example.com'
+
+  gen_server_cert \
+          'smtp_example_com' \
+          "${SUBJECT_BASE}/CN=smtp.example.com" \
+          "${CA_STARTDATE}" \
+          "${CA_ENDDATE}" \
+          'smtp.example.com'
+
+  gen_server_cert \
+          'imap_example.com' \
+          "${SUBJECT_BASE}/CN=imap.example.com" \
+          "${CA_STARTDATE}" \
+          "${CA_ENDDATE}" \
+          'imap.example.com'
+}
+
+main
+
+exit 0
